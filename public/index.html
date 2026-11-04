@@ -26,7 +26,8 @@ form.send textarea{flex:1;min-height:46px;max-height:140px;border-radius:14px;bo
 button.go{border:0;border-radius:14px;background:var(--acc);color:#0b0f1a;font-weight:700;padding:0 18px}
 button:disabled{opacity:.5}
 .clip{border:1px solid var(--line);background:var(--card);border-radius:14px;font-size:20px;width:46px;flex:none}
-.chip{display:flex;align-items:center;gap:8px;margin:0 16px 6px;padding:6px 10px;background:#1c2236;border-radius:999px;font-size:13px;color:var(--acc);align-self:flex-start;max-width:90%}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 16px 6px}
+.chip{display:flex;align-items:center;gap:8px;padding:6px 10px;background:#1c2236;border-radius:999px;font-size:13px;color:var(--acc);align-self:flex-start;max-width:90%}
 .chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chip button{background:none;border:0;color:var(--mut);font-size:14px}
 #login{padding:28px 20px}
@@ -53,10 +54,10 @@ button:disabled{opacity:.5}
 
 <section id="app" hidden style="display:none;flex:1;flex-direction:column;min-height:0">
   <div id="log"><div class="hint">Tell me what's going on, in English or Greek. I'll bring in the right agent.</div></div>
-  <div id="chip" class="chip" hidden><span id="chipname"></span><button type="button" id="chipx" aria-label="Remove file">✕</button></div>
+  <div id="chips" class="chips"></div>
   <form class="send" id="form">
     <button type="button" class="clip" id="clip" aria-label="Attach a document or photo">📎</button>
-    <input type="file" id="file" accept="application/pdf,image/jpeg,image/png,image/gif,image/webp" hidden>
+    <input type="file" id="file" multiple accept="application/pdf,image/*,.docx,.txt,.csv,.md,text/plain,text/csv,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
     <textarea id="q" rows="1" placeholder="Write here… or attach a document"></textarea>
     <button class="go" id="btn">Send</button>
   </form>
@@ -104,31 +105,47 @@ $("verify").onclick=async function(){
 };
 $("out").onclick=function(){sb.auth.signOut();thread=[];current=null;$("badge").style.display="none"};
 
-var pending=null; // {data, mediaType, name}
-var MAXB=7*1024*1024;
+var pending=[]; // [{data, mediaType, name}]
+var MAXB=7*1024*1024, MAXN=4;
+var EXT={docx:"application/vnd.openxmlformats-officedocument.wordprocessingml.document",txt:"text/plain",csv:"text/csv",md:"text/markdown"};
+function drawChips(){
+  var box=$("chips");box.innerHTML="";
+  pending.forEach(function(p,i){
+    var c=document.createElement("div");c.className="chip";
+    var s=document.createElement("span");s.textContent="📎 "+p.name;
+    var x=document.createElement("button");x.type="button";x.textContent="✕";x.setAttribute("aria-label","Remove "+p.name);
+    x.onclick=function(){pending.splice(i,1);drawChips()};
+    c.appendChild(s);c.appendChild(x);box.appendChild(c);
+  });
+}
 $("clip").onclick=function(){$("file").click()};
-$("chipx").onclick=function(){pending=null;$("chip").hidden=true;$("file").value=""};
 $("file").onchange=function(){
-  var f=$("file").files[0];if(!f)return;
-  if(f.size>MAXB){add("a","⚠️ File is too large (max 7 MB).");$("file").value="";return}
-  var rd=new FileReader();
-  rd.onload=function(){
-    pending={data:String(rd.result).split(",")[1],mediaType:f.type,name:f.name};
-    $("chipname").textContent="📎 "+f.name;$("chip").hidden=false;
-  };
-  rd.readAsDataURL(f);
+  var files=Array.prototype.slice.call($("file").files);$("file").value="";
+  files.forEach(function(f){
+    if(pending.length>=MAXN){add("a","⚠️ Up to "+MAXN+" files per message.");return}
+    var ext=(f.name.split(".").pop()||"").toLowerCase();
+    var type=f.type||EXT[ext]||"";
+    if(!type){add("a","⚠️ I can't read "+esc(f.name)+". Use PDF, photo, Word, TXT or CSV.");return}
+    if(f.size>MAXB){add("a","⚠️ "+esc(f.name)+" is too large (max 7 MB each).");return}
+    var rd=new FileReader();
+    rd.onload=function(){
+      if(pending.length>=MAXN)return;
+      pending.push({data:String(rd.result).split(",")[1],mediaType:type,name:f.name});drawChips();
+    };
+    rd.readAsDataURL(f);
+  });
 };
 
 async function send(){
   var q=$("q").value.trim();
-  if(!q&&pending)q=(/[Ͱ-Ͽ]/.test(navigator.language)||navigator.language.indexOf("el")===0)?"Δες αυτό το έγγραφο":"Please look at this document";
+  if(!q&&pending.length)q=(/[Ͱ-Ͽ]/.test(navigator.language)||navigator.language.indexOf("el")===0)?"Δες αυτά τα αρχεία":"Please look at these files";
   if(!q||!session)return;
-  var doc=pending;pending=null;$("chip").hidden=true;$("file").value="";
-  $("q").value="";add("u",(doc?"📎 "+esc(doc.name)+"<br>":"")+esc(q));thread.push({role:"user",content:q});
+  var docs=pending;pending=[];drawChips();
+  $("q").value="";add("u",docs.map(function(d){return "📎 "+esc(d.name)}).join("<br>")+(docs.length?"<br>":"")+esc(q));thread.push({role:"user",content:q});
   $("btn").disabled=true;var wait=add("a","…");
   try{
     var r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+session.access_token},
-      body:JSON.stringify({messages:thread,agent:current,document:doc})});
+      body:JSON.stringify({messages:thread,agent:current,documents:docs})});
     var d=await r.json();
     if(!r.ok)throw new Error(d.detail||d.error||"Error");
     var a=AG[d.agent];current=AG[d.agent]?d.agent:current;

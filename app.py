@@ -123,11 +123,14 @@ class ChatIn(BaseModel):
     messages: list[Msg]
     agent: str | None = None  # agent currently in the conversation (sticky)
     lang: str | None = None
-    document: Doc | None = None  # optional attachment on the newest user message
+    document: Doc | None = None  # legacy single attachment
+    documents: list[Doc] | None = None  # attachments on the newest user message
 
 
-DOC_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"}
-MAX_DOC_B64 = 14_000_000  # about 10 MB of file
+DOC_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"} | at.TEXT_TYPES
+MAX_DOCS = 4
+MAX_DOC_B64 = 14_000_000  # about 10 MB per file
+MAX_TOTAL_B64 = 28_000_000
 
 
 def clean(messages):
@@ -139,12 +142,14 @@ def detect_lang(text):
     return "el" if re.search(r"[Ͱ-Ͽ]", text or "") else "en"
 
 
-def route(history, current, doc=None):
+def route(history, current, docs=None):
     ctx = f"Current agent: {current or 'none'}\n\nConversation:\n" + "\n".join(
         f"{m['role'].upper()}: {m['content'][:400]}" for m in history[-4:])
-    if doc:
-        ctx += (f"\n\nThe user attached a file named '{doc.name}' ({doc.mediaType}). Legal papers (contracts, court "
-                "documents, notices) go to nomikos; lab results, prescriptions or medical documents go to asklepios.")
+    if docs:
+        names = ", ".join(f"'{d.name}' ({d.mediaType})" for d in docs)
+        ctx += (f"\n\nThe user attached: {names}. Legal papers (contracts, court documents, notices) go to nomikos; "
+                "lab results, prescriptions or medical documents for a person go to asklepios; a pet's photos, labs, "
+                "vaccination or vet records go to pets.")
     try:
         r = claude().messages.create(model=MODEL, max_tokens=8, system=ROUTER_SYSTEM, messages=[{"role": "user", "content": ctx}])
         word = "".join(b.text for b in r.content if b.type == "text").strip().lower()
@@ -158,23 +163,21 @@ def route(history, current, doc=None):
     return current if current in AGENTS else "general"
 
 
-def run_asklepios(history, lang, res, doc=None):
+def run_asklepios(history, lang, res, docs=None):
     system = ASKLEPIOS_SYSTEM
     block = triage_rules.alert_block(res)
     if block:
         system += "\n\n" + block
     messages = history
-    if doc:
-        kind = "document" if doc.mediaType == "application/pdf" else "image"
-        part = {"type": kind, "source": {"type": "base64", "media_type": doc.mediaType, "data": doc.data}}
+    if docs:
         last = history[-1]["content"]
-        messages = history[:-1] + [{"role": "user", "content": [part, {"type": "text", "text": last}]}]
-        system += ("\n\nThe user attached a file. If it is lab results, a prescription or a medical report, interpret it "
+        messages = history[:-1] + [{"role": "user", "content": at.doc_blocks(docs) + [{"type": "text", "text": last}]}]
+        system += ("\n\nThe user attached one or more files. If it is lab results, a prescription or a medical report, interpret it "
                    "clearly and cautiously: highlight values outside the reference range, explain what they may mean in plain "
                    "language, and say what to ask a doctor. Never diagnose. If it is a photo of a symptom, describe what you "
                    "see and give the same cautious triage advice.")
     try:
-        r = claude().messages.create(model=MODEL, max_tokens=1200 if doc else 900, system=system, messages=messages)
+        r = claude().messages.create(model=MODEL, max_tokens=1400 if docs else 900, system=system, messages=messages)
         text = "".join(b.text for b in r.content if b.type == "text").strip()
         text = text.replace("[[READY]]", "").strip()
         return text or triage_rules.fallback_reply(res, lang)
@@ -182,10 +185,18 @@ def run_asklepios(history, lang, res, doc=None):
         return triage_rules.fallback_reply(res, lang)
 
 
-def run_nomikos(history, lang, token, doc=None):
+def run_nomikos(history, lang, token, docs=None):
     payload = {"messages": history, "area": "unsure", "lang": lang, "mode": "quick"}
-    if doc:
-        payload["document"] = {"data": doc.data, "mediaType": doc.mediaType}
+    # Nomikos reads one PDF or image natively; text-like files are added to the question as plain text.
+    native = [d for d in (docs or []) if d.mediaType == "application/pdf" or d.mediaType.startswith("image/")]
+    extra = [d for d in (docs or []) if d not in native]
+    if native:
+        payload["document"] = {"data": native[0].data, "mediaType": native[0].mediaType}
+    if extra:
+        text = "\n\n".join(f"[Attached file: {d.name}]\n{at.extract_text(d)}" for d in extra)
+        msgs = [dict(m) for m in history]
+        msgs[-1]["content"] = (msgs[-1]["content"] + "\n\n" + text)[:8000]
+        payload["messages"] = msgs
     try:
         r = httpx.post(
             f"{NOMIKOS_API_URL}/api/analyze",
@@ -228,12 +239,16 @@ def chat(body: ChatIn, user=Depends(require_user)):
     if not history or history[-1]["role"] != "user":
         raise HTTPException(400, "Provide a user message.")
     lang = body.lang if body.lang in ("el", "en") else detect_lang(history[-1]["content"])
-    doc = body.document
-    if doc:
-        if doc.mediaType not in DOC_TYPES:
-            raise HTTPException(400, "Unsupported file type. Use PDF, JPG, PNG, GIF or WEBP.")
-        if len(doc.data) > MAX_DOC_B64:
-            raise HTTPException(413, "File is too large (max about 10 MB).")
+    docs = list(body.documents or ([body.document] if body.document else []))
+    if len(docs) > MAX_DOCS:
+        raise HTTPException(400, f"Attach at most {MAX_DOCS} files per message.")
+    for d in docs:
+        if d.mediaType not in DOC_TYPES:
+            raise HTTPException(400, "Unsupported file type. Use PDF, photo, Word (.docx), TXT or CSV.")
+        if len(d.data) > MAX_DOC_B64:
+            raise HTTPException(413, "A file is too large (max about 10 MB each).")
+    if sum(len(d.data) for d in docs) > MAX_TOTAL_B64:
+        raise HTTPException(413, "Files are too large together (max about 20 MB).")
 
     # Safety floors first, on every user turn, whatever agent is active.
     user_texts = [m["content"] for m in history if m["role"] == "user"]
@@ -249,21 +264,21 @@ def chat(body: ChatIn, user=Depends(require_user)):
     if res.hits and triage_rules.act_now_hits(res) and not pet_ctx:
         return {"agent": "asklepios", "reply": triage_rules.act_now_reply(res, lang), "emergency": True}
 
-    agent = route(history, body.agent, doc)
+    agent = route(history, body.agent, docs)
     if agent == "asklepios":
         if res.hits and triage_rules.act_now_hits(res):  # first-person red flag even in a pet-related chat
             return {"agent": "asklepios", "reply": triage_rules.act_now_reply(res, lang), "emergency": True}
-        reply = run_asklepios(history, lang, res, doc)
+        reply = run_asklepios(history, lang, res, docs)
     elif agent == "nomikos":
-        reply = run_nomikos(history, lang, user["token"], doc)
+        reply = run_nomikos(history, lang, user["token"], docs)
         if reply is None:
             reply = ("⚠️ Ο Νομικός Αρωγός δεν απαντά αυτή τη στιγμή. Δοκίμασε ξανά σε λίγο." if lang == "el"
                      else "⚠️ The legal agent isn't responding right now. Please try again shortly.")
     elif agent in ("pets", "ev", "money", "astro"):
         try:
             if agent == "pets":
-                reply = at.run_pets(history, lang, pet_res or at.pets_floor(species, user_texts), doc)
-            elif doc:
+                reply = at.run_pets(history, lang, pet_res or at.pets_floor(species, user_texts), docs)
+            elif docs:
                 reply = ("Αυτός ο βοηθός δεν διαβάζει αρχεία ακόμα. Γράψε μου την ερώτησή σου με λόγια." if lang == "el"
                          else "This agent can't read attachments yet. Please describe your question in words.")
             elif agent == "ev":

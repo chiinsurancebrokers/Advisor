@@ -3,6 +3,8 @@
 Each agent is Claude plus a short system prompt. EV, Smart Money and Astro call the live project apps through
 their public HTTP endpoints, so the numbers come from the real engines, not from the model's memory.
 """
+import base64
+import io
 import json
 import math
 import os
@@ -34,9 +36,37 @@ def _text(r):
     return "".join(b.text for b in r.content if b.type == "text").strip()
 
 
-def doc_part(doc):
-    kind = "document" if doc.mediaType == "application/pdf" else "image"
-    return {"type": kind, "source": {"type": "base64", "media_type": doc.mediaType, "data": doc.data}}
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+TEXT_TYPES = {"text/plain", "text/csv", "text/markdown", DOCX}
+
+
+def extract_text(doc):
+    """Text of a .txt/.csv/.md/.docx attachment, capped so one file cannot flood the context."""
+    raw = base64.b64decode(doc.data)
+    if doc.mediaType == DOCX:
+        from docx import Document
+        d = Document(io.BytesIO(raw))
+        parts = [p.text for p in d.paragraphs if p.text.strip()]
+        for t in d.tables:
+            for row in t.rows:
+                parts.append(" | ".join(c.text.strip() for c in row.cells))
+        text = "\n".join(parts)
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    return text[:60000]
+
+
+def doc_blocks(docs):
+    """Claude content blocks for attachments: PDFs and images natively, text-like files inlined."""
+    blocks = []
+    for d in docs or []:
+        if d.mediaType == "application/pdf":
+            blocks.append({"type": "document", "source": {"type": "base64", "media_type": d.mediaType, "data": d.data}})
+        elif d.mediaType.startswith("image/"):
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": d.mediaType, "data": d.data}})
+        else:
+            blocks.append({"type": "text", "text": f"[Attached file: {d.name}]\n{extract_text(d)}"})
+    return blocks
 
 
 def run_tools(system, history, tools, handlers, max_tokens=1100, max_iters=5):
@@ -105,17 +135,18 @@ def pets_floor(species, user_texts):
     return vet_rules.evaluate(species or "other", user_texts)
 
 
-def run_pets(history, lang, res, doc=None):
+def run_pets(history, lang, res, docs=None):
     system = PETS_SYSTEM
     hints = vet_rules.prompt_hints(res)
     if hints:
         system += "\n\n" + hints
     messages = history
-    if doc:
-        messages = history[:-1] + [{"role": "user", "content": [doc_part(doc), {"type": "text", "text": history[-1]["content"]}]}]
-        system += ("\n\nThe owner attached a file. If it is a photo of a symptom, describe what you see and give cautious triage advice. "
-                   "If it is lab results or a vet report, explain it in plain language, highlight values outside the range and say what to ask the vet.")
-    r = client().messages.create(model=MODEL, max_tokens=1200 if doc else 900, system=system, messages=messages)
+    if docs:
+        messages = history[:-1] + [{"role": "user", "content": doc_blocks(docs) + [{"type": "text", "text": history[-1]["content"]}]}]
+        system += ("\n\nThe owner attached one or more files. If one is a photo of a symptom, describe what you see and give cautious triage advice. "
+                   "If one is lab results, a vet report or vaccination or medical records, explain it in plain language, highlight values outside "
+                   "the range, note dates that matter (due vaccines, follow-ups) and say what to ask the vet. Name which file each point comes from.")
+    r = client().messages.create(model=MODEL, max_tokens=1400 if docs else 900, system=system, messages=messages)
     text = _text(r)
     text = re.sub(r"\[(TRIAGE|TOOL):[^\]]*\]", "", text).strip()
     return text
