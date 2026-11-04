@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>My Personal Advisor</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#262a33;--tx:#e8eaf0;--mut:#9aa1b0;--acc:#7c9cff}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.45 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;max-width:640px;margin-inline:auto}
+header{padding:calc(12px + env(safe-area-inset-top)) 16px 10px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+header h1{font-size:18px;margin:0;flex:1}
+#badge{font-size:13px;color:var(--acc);background:#1c2236;border-radius:999px;padding:4px 10px;display:none}
+#out{background:none;border:0;color:var(--mut);font-size:13px}
+#log{flex:1;overflow-y:auto;padding:14px 16px}
+.m{max-width:88%;margin:0 0 10px;padding:10px 13px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word}
+.u{margin-left:auto;background:var(--acc);color:#0b0f1a;border-bottom-right-radius:4px}
+.a{background:var(--card);border:1px solid var(--line);border-bottom-left-radius:4px}
+.a.em{border-color:#c0392b;background:#2a1717}
+.tag{display:block;font-size:12px;color:var(--mut);margin-bottom:4px}
+.a a{color:var(--acc)}
+form.send{display:flex;gap:8px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line)}
+form.send textarea{flex:1;min-height:46px;max-height:140px;border-radius:14px;border:1px solid var(--line);background:var(--card);color:var(--tx);padding:11px 13px;font:inherit;resize:none}
+button.go{border:0;border-radius:14px;background:var(--acc);color:#0b0f1a;font-weight:700;padding:0 18px}
+button:disabled{opacity:.5}
+#login{padding:28px 20px}
+#login p{color:var(--mut)}
+#login input{width:100%;padding:13px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--tx);font:inherit;margin:6px 0 10px}
+#login button{width:100%;padding:13px}
+.err{color:#ff9b9b;font-size:14px;min-height:20px}
+.hint{color:var(--mut);font-size:13px;padding:6px 16px}
+</style>
+</head>
+<body>
+<header><h1>My Personal Advisor</h1><span id="badge"></span><button id="out" hidden>Sign out</button></header>
+
+<section id="login" hidden>
+  <p>Sign in with your email. I'll send you a code.</p>
+  <input id="email" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com">
+  <button class="go" id="sendcode">Send code</button>
+  <div id="codebox" hidden>
+    <input id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="Code from your email">
+    <button class="go" id="verify">Sign in</button>
+  </div>
+  <div class="err" id="err"></div>
+</section>
+
+<section id="app" hidden style="display:none;flex:1;flex-direction:column;min-height:0">
+  <div id="log"><div class="hint">Tell me what's going on, in English or Greek. I'll bring in the right agent.</div></div>
+  <form class="send" id="form"><textarea id="q" rows="1" placeholder="Write here…"></textarea><button class="go" id="btn">Send</button></form>
+</section>
+
+<script>
+var sb, session, AG = {}, current = null, thread = [];
+var $ = function(id){return document.getElementById(id)};
+
+function esc(s){return s.replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
+function md(s){
+  return esc(s)
+    .replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g,"$1<i>$2</i>")
+    .replace(/_([^_\n]+)_/g,"<i>$1</i>")
+    .replace(/(https?:\/\/[^\s<)]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');
+}
+function add(cls, html, tag){
+  var d=document.createElement("div");d.className="m "+cls;
+  d.innerHTML=(tag?'<span class="tag">'+tag+'</span>':'')+html;
+  $("log").appendChild(d);$("log").scrollTop=$("log").scrollHeight;return d;
+}
+function show(loggedIn){
+  $("login").hidden=loggedIn;$("app").style.display=loggedIn?"flex":"none";$("out").hidden=!loggedIn;
+}
+async function init(){
+  var c=await (await fetch("/api/config")).json();
+  AG=c.agents||{};
+  sb=supabase.createClient(c.supabaseUrl,c.supabaseAnonKey);
+  var r=await sb.auth.getSession();session=r.data.session;
+  sb.auth.onAuthStateChange(function(_e,s){session=s;show(!!s)});
+  show(!!session);
+}
+$("sendcode").onclick=async function(){
+  $("err").textContent="";
+  var e=$("email").value.trim();if(!e)return;
+  var r=await sb.auth.signInWithOtp({email:e});
+  if(r.error){$("err").textContent=r.error.message;return}
+  $("codebox").hidden=false;$("err").textContent="Code sent. Check your email.";
+};
+$("verify").onclick=async function(){
+  $("err").textContent="";
+  var r=await sb.auth.verifyOtp({email:$("email").value.trim(),token:$("code").value.trim(),type:"email"});
+  if(r.error){$("err").textContent=r.error.message}
+};
+$("out").onclick=function(){sb.auth.signOut();thread=[];current=null;$("badge").style.display="none"};
+
+async function send(){
+  var q=$("q").value.trim();if(!q||!session)return;
+  $("q").value="";add("u",esc(q));thread.push({role:"user",content:q});
+  $("btn").disabled=true;var wait=add("a","…");
+  try{
+    var r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+session.access_token},
+      body:JSON.stringify({messages:thread,agent:current})});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.detail||d.error||"Error");
+    var a=AG[d.agent];current=AG[d.agent]?d.agent:current;
+    if(a){$("badge").textContent=a.icon+" "+a.name;$("badge").style.display="inline-block"}
+    wait.remove();
+    add("a"+(d.emergency?" em":""),md(d.reply),a?a.icon+" "+a.name:"");
+    thread.push({role:"assistant",content:d.reply});
+  }catch(e){wait.remove();add("a","⚠️ "+esc(e.message));thread.pop()}
+  $("btn").disabled=false;
+}
+$("form").onsubmit=function(e){e.preventDefault();send()};
+$("q").addEventListener("keydown",function(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send()}});
+init();
+</script>
+</body>
+</html>
