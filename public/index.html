@@ -25,6 +25,10 @@ form.send{display:flex;gap:8px;padding:10px 16px calc(10px + env(safe-area-inset
 form.send textarea{flex:1;min-height:46px;max-height:140px;border-radius:14px;border:1px solid var(--line);background:var(--card);color:var(--tx);padding:11px 13px;font:inherit;resize:none}
 button.go{border:0;border-radius:14px;background:var(--acc);color:#0b0f1a;font-weight:700;padding:0 18px}
 button:disabled{opacity:.5}
+.clip{border:1px solid var(--line);background:var(--card);border-radius:14px;font-size:20px;width:46px;flex:none}
+.chip{display:flex;align-items:center;gap:8px;margin:0 16px 6px;padding:6px 10px;background:#1c2236;border-radius:999px;font-size:13px;color:var(--acc);align-self:flex-start;max-width:90%}
+.chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip button{background:none;border:0;color:var(--mut);font-size:14px}
 #login{padding:28px 20px}
 #login p{color:var(--mut)}
 #login input{width:100%;padding:13px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--tx);font:inherit;margin:6px 0 10px}
@@ -49,7 +53,13 @@ button:disabled{opacity:.5}
 
 <section id="app" hidden style="display:none;flex:1;flex-direction:column;min-height:0">
   <div id="log"><div class="hint">Tell me what's going on, in English or Greek. I'll bring in the right agent.</div></div>
-  <form class="send" id="form"><textarea id="q" rows="1" placeholder="Write here…"></textarea><button class="go" id="btn">Send</button></form>
+  <div id="chip" class="chip" hidden><span id="chipname"></span><button type="button" id="chipx" aria-label="Remove file">✕</button></div>
+  <form class="send" id="form">
+    <button type="button" class="clip" id="clip" aria-label="Attach a document or photo">📎</button>
+    <input type="file" id="file" accept="application/pdf,image/jpeg,image/png,image/gif,image/webp" hidden>
+    <textarea id="q" rows="1" placeholder="Write here… or attach a document"></textarea>
+    <button class="go" id="btn">Send</button>
+  </form>
 </section>
 
 <script>
@@ -94,13 +104,31 @@ $("verify").onclick=async function(){
 };
 $("out").onclick=function(){sb.auth.signOut();thread=[];current=null;$("badge").style.display="none"};
 
+var pending=null; // {data, mediaType, name}
+var MAXB=7*1024*1024;
+$("clip").onclick=function(){$("file").click()};
+$("chipx").onclick=function(){pending=null;$("chip").hidden=true;$("file").value=""};
+$("file").onchange=function(){
+  var f=$("file").files[0];if(!f)return;
+  if(f.size>MAXB){add("a","⚠️ File is too large (max 7 MB).");$("file").value="";return}
+  var rd=new FileReader();
+  rd.onload=function(){
+    pending={data:String(rd.result).split(",")[1],mediaType:f.type,name:f.name};
+    $("chipname").textContent="📎 "+f.name;$("chip").hidden=false;
+  };
+  rd.readAsDataURL(f);
+};
+
 async function send(){
-  var q=$("q").value.trim();if(!q||!session)return;
-  $("q").value="";add("u",esc(q));thread.push({role:"user",content:q});
+  var q=$("q").value.trim();
+  if(!q&&pending)q=(/[Ͱ-Ͽ]/.test(navigator.language)||navigator.language.indexOf("el")===0)?"Δες αυτό το έγγραφο":"Please look at this document";
+  if(!q||!session)return;
+  var doc=pending;pending=null;$("chip").hidden=true;$("file").value="";
+  $("q").value="";add("u",(doc?"📎 "+esc(doc.name)+"<br>":"")+esc(q));thread.push({role:"user",content:q});
   $("btn").disabled=true;var wait=add("a","…");
   try{
     var r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+session.access_token},
-      body:JSON.stringify({messages:thread,agent:current})});
+      body:JSON.stringify({messages:thread,agent:current,document:doc})});
     var d=await r.json();
     if(!r.ok)throw new Error(d.detail||d.error||"Error");
     var a=AG[d.agent];current=AG[d.agent]?d.agent:current;

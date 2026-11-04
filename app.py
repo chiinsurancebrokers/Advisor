@@ -58,8 +58,10 @@ Triage - NON-EMERGENCY rule: recommend seeing a doctor (not self-care) when ANY 
   - The diagnosis needs professional confirmation before treatment
   - There is a risk of deterioration without monitoring
   - Symptoms persist more than 48-72 hours without improvement
-Keep answers short and easy to read on a phone. If the user wants a photo assessment, lab-result reading or a full
-clinical report, tell them those live in the full Asklepios app (https://asklepiosainurse.up.railway.app)."""
+Keep answers short and easy to read on a phone. This is a plain text chat: never mention maps, buttons, body diagrams
+or any screen element that does not exist here; when you need a location, just ask the user to describe it in words.
+Users can attach a PDF or photo with the paperclip. A full clinical report lives in the full Asklepios app
+(https://asklepiosainurse.up.railway.app)."""
 
 app = FastAPI(title="Personal Advisor")
 _claude = None
@@ -109,10 +111,21 @@ class Msg(BaseModel):
     content: str
 
 
+class Doc(BaseModel):
+    data: str  # base64
+    mediaType: str
+    name: str = ""
+
+
 class ChatIn(BaseModel):
     messages: list[Msg]
     agent: str | None = None  # agent currently in the conversation (sticky)
     lang: str | None = None
+    document: Doc | None = None  # optional attachment on the newest user message
+
+
+DOC_TYPES = {"application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"}
+MAX_DOC_B64 = 14_000_000  # about 10 MB of file
 
 
 def clean(messages):
@@ -124,10 +137,12 @@ def detect_lang(text):
     return "el" if re.search(r"[Ͱ-Ͽ]", text or "") else "en"
 
 
-def route(history, current):
-    last = history[-1]["content"]
+def route(history, current, doc=None):
     ctx = f"Current agent: {current or 'none'}\n\nConversation:\n" + "\n".join(
         f"{m['role'].upper()}: {m['content'][:400]}" for m in history[-4:])
+    if doc:
+        ctx += (f"\n\nThe user attached a file named '{doc.name}' ({doc.mediaType}). Legal papers (contracts, court "
+                "documents, notices) go to nomikos; lab results, prescriptions or medical documents go to asklepios.")
     try:
         r = claude().messages.create(model=MODEL, max_tokens=8, system=ROUTER_SYSTEM, messages=[{"role": "user", "content": ctx}])
         word = "".join(b.text for b in r.content if b.type == "text").strip().lower()
@@ -141,13 +156,23 @@ def route(history, current):
     return current if current in AGENTS else "general"
 
 
-def run_asklepios(history, lang, res):
+def run_asklepios(history, lang, res, doc=None):
     system = ASKLEPIOS_SYSTEM
     block = triage_rules.alert_block(res)
     if block:
         system += "\n\n" + block
+    messages = history
+    if doc:
+        kind = "document" if doc.mediaType == "application/pdf" else "image"
+        part = {"type": kind, "source": {"type": "base64", "media_type": doc.mediaType, "data": doc.data}}
+        last = history[-1]["content"]
+        messages = history[:-1] + [{"role": "user", "content": [part, {"type": "text", "text": last}]}]
+        system += ("\n\nThe user attached a file. If it is lab results, a prescription or a medical report, interpret it "
+                   "clearly and cautiously: highlight values outside the reference range, explain what they may mean in plain "
+                   "language, and say what to ask a doctor. Never diagnose. If it is a photo of a symptom, describe what you "
+                   "see and give the same cautious triage advice.")
     try:
-        r = claude().messages.create(model=MODEL, max_tokens=900, system=system, messages=history)
+        r = claude().messages.create(model=MODEL, max_tokens=1200 if doc else 900, system=system, messages=messages)
         text = "".join(b.text for b in r.content if b.type == "text").strip()
         text = text.replace("[[READY]]", "").strip()
         return text or triage_rules.fallback_reply(res, lang)
@@ -155,12 +180,15 @@ def run_asklepios(history, lang, res):
         return triage_rules.fallback_reply(res, lang)
 
 
-def run_nomikos(history, lang, token):
+def run_nomikos(history, lang, token, doc=None):
+    payload = {"messages": history, "area": "unsure", "lang": lang, "mode": "quick"}
+    if doc:
+        payload["document"] = {"data": doc.data, "mediaType": doc.mediaType}
     try:
         r = httpx.post(
             f"{NOMIKOS_API_URL}/api/analyze",
             headers={"Authorization": f"Bearer {token}"},
-            json={"messages": history, "area": "unsure", "lang": lang, "mode": "quick"},
+            json=payload,
             timeout=120,
         )
         r.raise_for_status()
@@ -198,6 +226,12 @@ def chat(body: ChatIn, user=Depends(require_user)):
     if not history or history[-1]["role"] != "user":
         raise HTTPException(400, "Provide a user message.")
     lang = body.lang if body.lang in ("el", "en") else detect_lang(history[-1]["content"])
+    doc = body.document
+    if doc:
+        if doc.mediaType not in DOC_TYPES:
+            raise HTTPException(400, "Unsupported file type. Use PDF, JPG, PNG, GIF or WEBP.")
+        if len(doc.data) > MAX_DOC_B64:
+            raise HTTPException(413, "File is too large (max about 10 MB).")
 
     # Safety floor first, on every user turn, whatever agent is active.
     user_texts = [m["content"] for m in history if m["role"] == "user"]
@@ -205,11 +239,11 @@ def chat(body: ChatIn, user=Depends(require_user)):
     if res.hits and triage_rules.act_now_hits(res):
         return {"agent": "asklepios", "reply": triage_rules.act_now_reply(res, lang), "emergency": True}
 
-    agent = route(history, body.agent)
+    agent = route(history, body.agent, doc)
     if agent == "asklepios":
-        reply = run_asklepios(history, lang, res)
+        reply = run_asklepios(history, lang, res, doc)
     elif agent == "nomikos":
-        reply = run_nomikos(history, lang, user["token"])
+        reply = run_nomikos(history, lang, user["token"], doc)
         if reply is None:
             reply = ("⚠️ Ο Νομικός Αρωγός δεν απαντά αυτή τη στιγμή. Δοκίμασε ξανά σε λίγο." if lang == "el"
                      else "⚠️ The legal agent isn't responding right now. Please try again shortly.")
