@@ -3,7 +3,7 @@
 Agents wired in this version:
   asklepios  - AI nurse. Kira's triage prompt + Kira's deterministic safety floor (triage_rules.py).
   nomikos    - Greek legal-information agent. Calls the live Nomikosarogos /api/analyze (RAG over the Codes).
-Others (pets, ev, money, astro) are recognised by the router and answered with a link until they are wired.
+pets, ev, money, astro live in agents_tools.py (pets uses the vet safety floor; the others call the live project apps).
 
 Safety: every user message goes through the Asklepios red-flag rules FIRST, whichever agent is active.
 If an act-now rule fires, the fixed emergency message is returned and no AI is called.
@@ -20,7 +20,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import agents_tools as at
 import triage_rules
+import vet_rules
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
@@ -31,10 +33,10 @@ MODEL = os.environ.get("ADVISOR_MODEL", "claude-sonnet-4-6")
 AGENTS = {
     "asklepios": {"name": "Asklepios", "icon": "🩺", "live": True},
     "nomikos": {"name": "Nomikosarogos", "icon": "⚖️", "live": True},
-    "pets": {"name": "PetsAIHealth", "icon": "🐾", "live": False, "url": "https://app.petsaihealth.com"},
-    "ev": {"name": "EV Charger", "icon": "🔌", "live": False, "url": "https://evchargers.up.railway.app"},
-    "money": {"name": "Smart Money", "icon": "💰", "live": False, "url": "https://smartmoneywatcher.up.railway.app"},
-    "astro": {"name": "Astro Forecast", "icon": "🔮", "live": False, "url": "https://astro-forecast.up.railway.app"},
+    "pets": {"name": "PetsAIHealth", "icon": "🐾", "live": True, "url": "https://app.petsaihealth.com"},
+    "ev": {"name": "EV Charger", "icon": "🔌", "live": True, "url": "https://evchargers.up.railway.app"},
+    "money": {"name": "Smart Money", "icon": "💰", "live": True, "url": "https://smartmoneywatcher.up.railway.app"},
+    "astro": {"name": "Astro Forecast", "icon": "🔮", "live": True, "url": "https://astro-forecast.up.railway.app"},
 }
 
 ROUTER_SYSTEM = """You route a user's message to one specialist agent. Reply with ONLY one word from this list:
@@ -233,20 +235,50 @@ def chat(body: ChatIn, user=Depends(require_user)):
         if len(doc.data) > MAX_DOC_B64:
             raise HTTPException(413, "File is too large (max about 10 MB).")
 
-    # Safety floor first, on every user turn, whatever agent is active.
+    # Safety floors first, on every user turn, whatever agent is active.
     user_texts = [m["content"] for m in history if m["role"] == "user"]
+    species = at.detect_species(user_texts)
+    pet_ctx = species is not None or body.agent == "pets"
     res = triage_rules.evaluate(user_texts)
-    if res.hits and triage_rules.act_now_hits(res):
+    pet_res = at.pets_floor(species, user_texts) if pet_ctx else None
+    if pet_res and vet_rules.act_now_hits(pet_res):
+        reply = vet_rules.act_now_reply(vet_rules.act_now_hits(pet_res), lang)
+        if res.hits and triage_rules.act_now_hits(res):
+            reply += "\n\n" + ("Αν εσύ ο ίδιος νιώθεις άσχημα: κάλεσε 166 ή 112." if lang == "el" else "If you yourself feel unwell: call 166 or 112.")
+        return {"agent": "pets", "reply": reply, "emergency": True}
+    if res.hits and triage_rules.act_now_hits(res) and not pet_ctx:
         return {"agent": "asklepios", "reply": triage_rules.act_now_reply(res, lang), "emergency": True}
 
     agent = route(history, body.agent, doc)
     if agent == "asklepios":
+        if res.hits and triage_rules.act_now_hits(res):  # first-person red flag even in a pet-related chat
+            return {"agent": "asklepios", "reply": triage_rules.act_now_reply(res, lang), "emergency": True}
         reply = run_asklepios(history, lang, res, doc)
     elif agent == "nomikos":
         reply = run_nomikos(history, lang, user["token"], doc)
         if reply is None:
             reply = ("⚠️ Ο Νομικός Αρωγός δεν απαντά αυτή τη στιγμή. Δοκίμασε ξανά σε λίγο." if lang == "el"
                      else "⚠️ The legal agent isn't responding right now. Please try again shortly.")
+    elif agent in ("pets", "ev", "money", "astro"):
+        try:
+            if agent == "pets":
+                reply = at.run_pets(history, lang, pet_res or at.pets_floor(species, user_texts), doc)
+            elif doc:
+                reply = ("Αυτός ο βοηθός δεν διαβάζει αρχεία ακόμα. Γράψε μου την ερώτησή σου με λόγια." if lang == "el"
+                         else "This agent can't read attachments yet. Please describe your question in words.")
+            elif agent == "ev":
+                reply = at.run_ev(history, lang)
+            elif agent == "money":
+                reply = at.run_money(history, lang)
+            else:
+                reply = at.run_astro(history, lang)
+        except Exception:
+            reply = ("⚠️ Ο βοηθός δεν απαντά αυτή τη στιγμή. Δοκίμασε ξανά σε λίγο." if lang == "el"
+                     else "⚠️ That agent isn't responding right now. Please try again shortly.")
+            if agent == "pets":
+                reply += ("\n\nΑν το κατοικίδιό σου έχει δύσκολη αναπνοή, κατάρρευση ή δηλητηρίαση, πήγαινε αμέσως σε κτηνίατρο."
+                          if lang == "el" else
+                          "\n\nIf your pet has trouble breathing, has collapsed or may have eaten a toxin, go to a vet now.")
     elif agent in AGENTS:
         reply = link_reply(agent, lang)
     else:
