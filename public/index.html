@@ -91,16 +91,31 @@ async function init(){
   sb.auth.onAuthStateChange(function(_e,s){session=s;show(!!s)});
   show(!!session);
 }
+// One request per tap, then a 60 s cooldown: a double tap used to send two codes, and the second code invalidates the first.
+var sending=false, resendAt=0, cdTimer=null;
+function cooldown(){
+  var left=Math.ceil((resendAt-Date.now())/1000), b=$("sendcode");
+  if(left>0){b.disabled=true;b.textContent="Send a new code ("+left+"s)";return}
+  clearInterval(cdTimer);b.disabled=false;b.textContent="Send a new code";
+}
 $("sendcode").onclick=async function(){
+  if(sending||Date.now()<resendAt)return;
   $("err").textContent="";
   var e=$("email").value.trim();if(!e)return;
-  var r=await sb.auth.signInWithOtp({email:e});
-  if(r.error){$("err").textContent=r.error.message;return}
-  $("codebox").hidden=false;$("err").textContent="Code sent. Check your email.";
+  sending=true;this.disabled=true;
+  var r;
+  try{r=await sb.auth.signInWithOtp({email:e})}catch(x){r={error:{message:"Could not send the code. Try again."}}}
+  sending=false;
+  if(r.error){$("err").textContent=r.error.message;this.disabled=false;return}
+  $("codebox").hidden=false;$("err").textContent="Code sent. Use the newest code in your inbox.";
+  resendAt=Date.now()+60000;clearInterval(cdTimer);cdTimer=setInterval(cooldown,1000);cooldown();
 };
+var verifying=false;
 $("verify").onclick=async function(){
-  $("err").textContent="";
+  if(verifying)return;
+  $("err").textContent="";verifying=true;this.disabled=true;
   var r=await sb.auth.verifyOtp({email:$("email").value.trim(),token:$("code").value.trim(),type:"email"});
+  verifying=false;this.disabled=false;
   if(r.error){$("err").textContent=r.error.message}
 };
 $("out").onclick=function(){sb.auth.signOut();thread=[];current=null;$("badge").style.display="none"};

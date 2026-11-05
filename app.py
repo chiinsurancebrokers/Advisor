@@ -277,7 +277,7 @@ def chat(body: ChatIn, user=Depends(require_user)):
     elif agent in ("pets", "ev", "money", "astro"):
         try:
             if agent == "pets":
-                reply = at.run_pets(history, lang, pet_res or at.pets_floor(species, user_texts), docs)
+                reply = at.run_pets(history, lang, pet_res or at.pets_floor(species, user_texts), docs, species=species)
             elif docs:
                 reply = ("Αυτός ο βοηθός δεν διαβάζει αρχεία ακόμα. Γράψε μου την ερώτησή σου με λόγια." if lang == "el"
                          else "This agent can't read attachments yet. Please describe your question in words.")
