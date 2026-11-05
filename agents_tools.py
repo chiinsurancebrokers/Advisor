@@ -14,6 +14,7 @@ import time
 import anthropic
 import httpx
 
+import kb_vet
 import vet_rules
 
 MODEL = os.environ.get("ADVISOR_MODEL", "claude-sonnet-4-6")
@@ -110,7 +111,14 @@ Three triage levels. Choose from the facts, not from fear:
 Before a final URGENT or SELF_CARE, make sure you know: species and age, how long it has lasted, appetite and water, vomiting, diarrhoea or
 urination, any toxin or foreign body, and how bright the pet is. Skip what the owner already said. For a clear emergency, do not wait.
 This is a plain text chat: never mention buttons, tools or screens that do not exist here. Owners can attach a photo or PDF with the paperclip.
-Reminders, a vet finder, insurance and full reports live in the PetsAIHealth app (https://app.petsaihealth.com)."""
+Reminders, a vet finder, insurance and full reports live in the PetsAIHealth app (https://app.petsaihealth.com).
+
+OPENING: never start with a greeting or a welcome ("Hello", "Glad you came", "Χαίρομαι που...", "Happy to help"). The owner is worried about a sick pet:
+open with ONE short clause of concern that names the pet (e.g. "Λυπάμαι που ο Σπίθας δεν είναι καλά." / "Sorry Rex is unwell."), then go straight to your
+advice or your ONE question. No cheerful words and no emoji in the first line.
+GROUNDING: a block "RETRIEVED REFERENCE FACTS" may follow. Base thresholds, drugs, time windows and numbers only on those facts or the SAFETY RULE ALERTS;
+if something is not covered, say you cannot verify it and send the owner to the vet. Put the fact's tag, like [S2], right after the sentence that relies on it.
+Name what the findings fit as "possible" causes (most likely first), never as a diagnosis."""
 
 _SPECIES_PATTERNS = [
     ("dog", r"\bdogs?\b|\bpupp(y|ies)\b|\bpooch\b|σκυλ|κουταβ"),
@@ -135,11 +143,19 @@ def pets_floor(species, user_texts):
     return vet_rules.evaluate(species or "other", user_texts)
 
 
-def run_pets(history, lang, res, docs=None):
+def run_pets(history, lang, res, docs=None, species=None):
     system = PETS_SYSTEM
     hints = vet_rules.prompt_hints(res)
     if hints:
         system += "\n\n" + hints
+    found = []
+    try:  # retrieval over the curated vet guidance (kb_vet); never blocks the answer
+        block, found = kb_vet.retrieve(species, [m["content"] for m in history if m["role"] == "user"], [h.id for h in res.hits])
+        if block:
+            system += "\n\n" + block
+            print(json.dumps({"event": "kb_retrieve", "agent": "pets", "ids": kb_vet.ids(found)}), flush=True)
+    except Exception:
+        found = []
     messages = history
     if docs:
         messages = history[:-1] + [{"role": "user", "content": doc_blocks(docs) + [{"type": "text", "text": history[-1]["content"]}]}]
@@ -149,7 +165,7 @@ def run_pets(history, lang, res, docs=None):
     r = client().messages.create(model=MODEL, max_tokens=1400 if docs else 900, system=system, messages=messages)
     text = _text(r)
     text = re.sub(r"\[(TRIAGE|TOOL):[^\]]*\]", "", text).strip()
-    return text
+    return kb_vet.cite(text, found, lang)
 
 
 # ───────────────────────────── EV Charger ─────────────────────────────
