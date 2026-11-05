@@ -107,10 +107,22 @@ GLOSSARY = {
 }
 
 
+# Everyday English wording -> the term the guidance uses.
+SYNONYMS = {
+    "hurt": "pain", "hurts": "pain", "hurting": "pain", "ache": "pain", "aches": "pain", "aching": "pain", "sore": "pain",
+    "puke": "vomit", "puking": "vomit", "threw": "vomit", "throwing": "vomit", "sick": "vomit",
+    "poop": "stool", "poo": "stool", "pee": "urine", "peeing": "urine", "wee": "urine", "tummy": "abdomen belly",
+    "breathless": "breathing", "wheezing": "breathing", "limping": "limp lameness", "scratching": "itch",
+}
+
+
 def expand(text):
-    """Query tokens plus the English terms the glossary maps the Greek words to."""
+    """Query tokens plus the English terms the glossary and synonym table map the words to."""
     base = tokens(text)
     extra = []
+    for raw in re.findall(r"[a-z]+", fold(text)):
+        if raw in SYNONYMS:
+            extra += tokens(SYNONYMS[raw])
     for raw in re.findall(r"[α-ω]+", fold(text)):
         for pre, en in GLOSSARY.items():
             if raw.startswith(pre):

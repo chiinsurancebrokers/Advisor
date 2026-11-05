@@ -32,4 +32,18 @@ out = ask(["ποιος είναι ο πρωθυπουργός"], "Μπορώ ν�
 check("no retrieval block for an unrelated message", "[S1]" not in SEEN["system"])
 ask(["Έφαγε σοκολάτα"], "ok")
 check("keyword topics still reach the prompt", "theobromine" in SEEN["system"])
+
+# Asklepios (human) agent
+import app as advisor
+from types import SimpleNamespace as NS
+seen = {}
+class _M:
+    def create(self, **kw):
+        seen.update(kw); return NS(content=[NS(type="text", text="Κάλεσε τώρα 166 [S1].")], stop_reason="end_turn")
+advisor._claude = NS(messages=_M())
+hist = [{"role": "user", "content": "πονάει το στήθος μου και ιδρώνω"}]
+import triage_rules
+out = advisor.run_asklepios(hist, "el", triage_rules.evaluate([hist[0]["content"]]))
+check("asklepios: retrieved facts tagged in the prompt", "[S1]" in seen["system"] and "RETRIEVED REFERENCE FACTS" in seen["system"])
+check("asklepios: tag removed, source listed", "[S1]" not in out and "Πηγές:" in out)
 print(f"\n{fails} failed"); sys.exit(1 if fails else 0)

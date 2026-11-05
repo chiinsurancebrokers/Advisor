@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import agents_tools as at
+import kb_med
 import triage_rules
 import vet_rules
 
@@ -63,7 +64,9 @@ Triage - NON-EMERGENCY rule: recommend seeing a doctor (not self-care) when ANY 
 Keep answers short and easy to read on a phone. This is a plain text chat: never mention maps, buttons, body diagrams
 or any screen element that does not exist here; when you need a location, just ask the user to describe it in words.
 Users can attach a PDF or photo with the paperclip. A full clinical report lives in the full Asklepios app
-(https://asklepiosainurse.up.railway.app)."""
+(https://asklepiosainurse.up.railway.app).
+A block "RETRIEVED REFERENCE FACTS" may follow. State thresholds, drugs, time windows and numbers only if they are in those facts or in the SAFETY RULES;
+otherwise say you cannot verify it. Put the fact's tag, like [S2], right after the sentence that relies on it. Never use a fact to lower urgency."""
 
 app = FastAPI(title="Personal Advisor")
 _claude = None
@@ -168,6 +171,14 @@ def run_asklepios(history, lang, res, docs=None):
     block = triage_rules.alert_block(res)
     if block:
         system += "\n\n" + block
+    found = []
+    try:  # retrieval over the curated clinical guidance (kb_med); never blocks the answer
+        kb_text, found = kb_med.retrieve([m["content"] for m in history if m["role"] == "user"], [h.id for h in res.hits])
+        if kb_text:
+            system += "\n\n" + kb_text
+            print(json.dumps({"event": "kb_retrieve", "agent": "asklepios", "ids": kb_med.ids(found)}), flush=True)
+    except Exception:
+        found = []
     messages = history
     if docs:
         last = history[-1]["content"]
@@ -180,7 +191,7 @@ def run_asklepios(history, lang, res, docs=None):
         r = claude().messages.create(model=MODEL, max_tokens=1400 if docs else 900, system=system, messages=messages)
         text = "".join(b.text for b in r.content if b.type == "text").strip()
         text = text.replace("[[READY]]", "").strip()
-        return text or triage_rules.fallback_reply(res, lang)
+        return kb_med.cite(text, found, lang) if text else triage_rules.fallback_reply(res, lang)
     except Exception:
         return triage_rules.fallback_reply(res, lang)
 
